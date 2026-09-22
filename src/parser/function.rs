@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use lazy_static::lazy_static;
 
@@ -23,7 +23,131 @@ use crate::parser::{Expr, Prettier};
 use crate::util::join_vector;
 
 lazy_static! {
-    static ref EXTRA_FUNCTIONS: RwLock<HashMap<String, Function>> = RwLock::new(HashMap::new());
+    /// Process-wide registry backing the zero-configuration [`crate::parser::parse`]
+    /// entry point and the legacy [`register_extra_functions`] API.
+    ///
+    /// A parse only ever reads a cheap [`FunctionRegistry`] snapshot (an `Arc`
+    /// clone) taken at the start of the parse, so concurrent updates never
+    /// affect an in-flight parse.
+    static ref GLOBAL_REGISTRY: RwLock<FunctionRegistry> =
+        RwLock::new(FunctionRegistry::default());
+}
+
+/// Policy deciding what happens when a custom function is registered under a
+/// name that is already taken (either by a built-in function or by another
+/// function in the same builder).
+///
+/// Registration never silently overwrites an existing definition: it either
+/// fails explicitly or the caller has opted in to overriding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FunctionOverridePolicy {
+    /// Reject conflicting registrations with an error. This is the default.
+    #[default]
+    Error,
+    /// Allow the new definition to replace the conflicting one.
+    Allow,
+}
+
+/// A read-only, cheaply cloneable set of function definitions used by the
+/// parser to resolve function calls.
+///
+/// A registry always resolves the built-in Prometheus functions (they are
+/// shared, not copied); custom functions registered on top live in an
+/// [`Arc`]-shared map, so cloning a registry is O(1) and never deep-copies
+/// the definitions. Function names are `&'static str`, hence a registry never
+/// borrows strings tied to a parser's lifetime.
+///
+/// Registries are immutable once built. Use [`FunctionRegistryBuilder`] to
+/// derive an extended registry from an existing one.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionRegistry {
+    /// Custom functions shadowing or extending the built-ins. Empty for the
+    /// default registry, in which case lookups fall straight through to the
+    /// shared built-in table.
+    extras: Arc<HashMap<&'static str, Function>>,
+}
+
+impl FunctionRegistry {
+    /// Returns a builder seeded with the default (built-ins only) registry.
+    pub fn builder() -> FunctionRegistryBuilder {
+        FunctionRegistryBuilder::default()
+    }
+
+    /// Looks up a function by name. Custom functions take precedence over
+    /// built-ins (which are the fallback), matching Prometheus's
+    /// case-sensitive function names.
+    pub fn get(&self, name: &str) -> Option<&Function> {
+        self.extras.get(name).or_else(|| FUNCTIONS.get(name))
+    }
+
+    /// Returns true if a function with the given name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+}
+
+/// Builder for deriving a [`FunctionRegistry`] from an existing one.
+///
+/// The builder owns a private copy of the base registry's custom functions;
+/// building produces a new immutable registry and leaves the base registry
+/// untouched, so a snapshot taken before a concurrent `build()` is unaffected.
+#[derive(Debug, Clone, Default)]
+pub struct FunctionRegistryBuilder {
+    extras: HashMap<&'static str, Function>,
+    policy: FunctionOverridePolicy,
+}
+
+impl FunctionRegistryBuilder {
+    /// Creates a builder seeded from the default registry (built-ins only).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a builder seeded with the custom functions of `registry`,
+    /// allowing registries to be copied or persisted and extended further.
+    pub fn from_registry(registry: &FunctionRegistry) -> Self {
+        Self {
+            extras: (*registry.extras).clone(),
+            policy: FunctionOverridePolicy::default(),
+        }
+    }
+
+    /// Sets the policy for name conflicts with already-registered functions
+    /// (built-in or custom). Defaults to [`FunctionOverridePolicy::Error`].
+    pub fn with_override_policy(mut self, policy: FunctionOverridePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Registers a custom function.
+    ///
+    /// Returns an error if the name conflicts with a built-in function or a
+    /// previously registered custom function, unless the override policy is
+    /// [`FunctionOverridePolicy::Allow`].
+    pub fn register(&mut self, func: Function) -> Result<&mut Self, String> {
+        let name = func.name;
+        if self.policy == FunctionOverridePolicy::Error {
+            if FUNCTIONS.contains_key(name) {
+                return Err(format!(
+                    "cannot register custom function \"{name}\": conflicts with built-in function"
+                ));
+            }
+            if self.extras.contains_key(name) {
+                return Err(format!(
+                    "cannot register custom function \"{name}\": already registered"
+                ));
+            }
+        }
+        self.extras.insert(name, func);
+        Ok(self)
+    }
+
+    /// Builds the immutable registry.
+    pub fn build(self) -> FunctionRegistry {
+        FunctionRegistry {
+            extras: Arc::new(self.extras),
+        }
+    }
 }
 
 /// Register additional custom functions that the parser will recognize.
@@ -50,7 +174,7 @@ lazy_static! {
 /// assert!(result.is_ok());
 /// ```
 pub fn register_extra_functions(funcs: Vec<Function>) -> Result<(), String> {
-    let mut map = EXTRA_FUNCTIONS.write().unwrap();
+    let mut guard = GLOBAL_REGISTRY.write().unwrap();
     for f in &funcs {
         if FUNCTIONS.contains_key(f.name) {
             return Err(format!(
@@ -59,15 +183,28 @@ pub fn register_extra_functions(funcs: Vec<Function>) -> Result<(), String> {
             ));
         }
     }
+    let mut extras = (*guard.extras).clone();
     for f in funcs {
-        map.insert(f.name.to_string(), f);
+        extras.insert(f.name, f);
     }
+    *guard = FunctionRegistry {
+        extras: Arc::new(extras),
+    };
     Ok(())
 }
 
 /// Clear all previously registered custom functions.
 pub fn clear_extra_functions() {
-    EXTRA_FUNCTIONS.write().unwrap().clear();
+    *GLOBAL_REGISTRY.write().unwrap() = FunctionRegistry::default();
+}
+
+/// Returns a snapshot of the process-wide registry used by the
+/// zero-configuration [`crate::parser::parse`] entry point.
+///
+/// The snapshot is a cheap `Arc` clone: it stays fixed even if another
+/// thread registers or clears functions afterwards.
+pub(crate) fn global_registry_snapshot() -> FunctionRegistry {
+    GLOBAL_REGISTRY.read().unwrap().clone()
 }
 
 /// called by func in Call
@@ -652,11 +789,9 @@ lazy_static! {
 
 /// get_function returns a predefined Function object for the given name.
 /// It checks built-in functions first, then any registered custom functions.
+#[cfg(test)]
 pub(crate) fn get_function(name: &str) -> Option<Function> {
-    FUNCTIONS
-        .get(name)
-        .cloned()
-        .or_else(|| EXTRA_FUNCTIONS.read().unwrap().get(name).cloned())
+    global_registry_snapshot().get(name).cloned()
 }
 
 #[cfg(test)]

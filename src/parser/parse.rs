@@ -12,15 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::parser::function::{global_registry_snapshot, FunctionRegistry};
 use crate::parser::{lex, Expr, INVALID_QUERY_INFO};
 
 /// Parse the given query literal to an AST (which is [`Expr`] in this crate).
+///
+/// This is the zero-configuration entry point: it resolves functions against
+/// a snapshot of the process-wide registry (built-in functions plus anything
+/// registered via [`crate::parser::register_extra_functions`]). The snapshot
+/// is fixed for the duration of this call. Use [`parse_with_registry`] to
+/// parse against an explicit [`FunctionRegistry`] instead.
 pub fn parse(input: &str) -> Result<Expr, String> {
+    parse_with_registry(input, &global_registry_snapshot())
+}
+
+/// Parse the given query literal using an explicit function registry.
+///
+/// The registry is only read, never mutated, and no process-global state is
+/// consulted: two threads parsing the same input with different registries
+/// cannot interfere with each other.
+pub fn parse_with_registry(input: &str, registry: &FunctionRegistry) -> Result<Expr, String> {
     match lex::lexer(input) {
         Err(e) => Err(e),
         Ok(lexer) => {
             // NOTE: the errs is ignored so far.
-            let (res, _errs) = crate::promql_y::parse(&lexer);
+            let (res, _errs) = crate::promql_y::parse(&lexer, registry);
             res.ok_or_else(|| String::from(INVALID_QUERY_INFO))?
         }
     }

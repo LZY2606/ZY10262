@@ -127,6 +127,8 @@ START_METRIC_SELECTOR
 
 %start start
 
+%parse-param registry: &FunctionRegistry
+
 // Operators are listed with increasing precedence.
 %left LOR
 %left LAND LUNLESS
@@ -351,17 +353,17 @@ function_call -> Result<Expr, String>:
                 IDENTIFIER function_call_body
                 {
                         let name = lexeme_to_string($lexer, &$1)?;
-                        match get_function(&name) {
+                        match registry.get(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
-                            Some(func) => Expr::new_call(func, $2?)
+                            Some(func) => Expr::new_call(func.clone(), $2?)
                         }
                 }
         |       at_modifier_preprocessors function_call_body
                 {
                         let name = $1?.val;
-                        match get_function(&name) {
+                        match registry.get(&name) {
                             None => Err(format!("unknown function with name '{name}'")),
-                            Some(func) => Expr::new_call(func, $2?)
+                            Some(func) => Expr::new_call(func.clone(), $2?)
                         }
                 }
 ;
@@ -706,7 +708,7 @@ use std::time::Duration;
 use crate::label::{Labels, Matcher, Matchers};
 use crate::parser::{AtModifier, BinModifier, Expr, FunctionArgs, LabelModifier, Offset, VectorMatchCardinality, VectorMatchFillValues};
 use crate::parser::ast::check_ast;
-use crate::parser::function::get_function;
+use crate::parser::function::FunctionRegistry;
 use crate::parser::lex::is_label;
 use crate::parser::production::{lexeme_to_string, lexeme_to_token, span_to_string};
 use crate::parser::token::{Token, T_IDENTIFIER};

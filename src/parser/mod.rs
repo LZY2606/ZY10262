@@ -33,9 +33,12 @@ pub use ast::{
     LabelModifier, MatrixSelector, NumberLiteral, Offset, ParenExpr, StringLiteral, SubqueryExpr,
     UnaryExpr, VectorMatchCardinality, VectorMatchFillValues, VectorSelector,
 };
-pub use function::{clear_extra_functions, register_extra_functions, Function, FunctionArgs};
+pub use function::{
+    clear_extra_functions, register_extra_functions, Function, FunctionArgs,
+    FunctionOverridePolicy, FunctionRegistry, FunctionRegistryBuilder,
+};
 pub use lex::lexer;
-pub use parse::parse;
+pub use parse::{parse, parse_with_registry};
 
 // FIXME: show more helpful error message to some invalid promql queries.
 const INVALID_QUERY_INFO: &str = "invalid promql query";
